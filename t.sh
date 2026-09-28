@@ -10,8 +10,12 @@
 #   1. save diagnostics (nothing changed yet)
 #   2. find out why systemd-timesyncd is not synchronizing (DNS? UDP 123? config?)
 #   3. set reliable NTP servers; force a sync now (HTTPS time as a bounded fallback)
-#   4. install boot behavior: network -> time check (bounded, ~2 min) -> cloudflared,
-#      plus a 10-minute re-check timer; nothing can block remote access forever
+#   4. install boot behavior (never loosening TLS):
+#        bad RTC -> restore the last saved time (systemd-timesyncd clock file, saved
+#        every 60 s) -> network -> NTP (bounded wait) -> certificate-verified HTTPS time
+#        only if NTP fails -> cloudflared; plus a 10-minute re-check timer.
+#      Always bounded (~2 min): an NTP outage can never block remote access forever.
+#      systemd-time-wait-sync is NOT used for this: it waits forever (TimeoutStartSec=infinity).
 #   5. verify, then re-run the val-admin self-test
 set -u
 TS=$(date -u +%Y%m%dT%H%M%SZ)
@@ -97,6 +101,9 @@ cat > /etc/systemd/timesyncd.conf.d/60-valiant.conf <<'EOF'
 NTP=time.cloudflare.com time.google.com 0.debian.pool.ntp.org 1.debian.pool.ntp.org
 FallbackNTP=2.debian.pool.ntp.org 3.debian.pool.ntp.org
 ConnectionRetrySec=15
+# Save the time every 60 s (the default, stated explicitly): after power loss the
+# clock restarts from the last saved time instead of the RTC's 2001.
+SaveIntervalSec=60
 EOF
 timedatectl set-ntp true 2>/dev/null
 systemctl restart systemd-timesyncd
@@ -112,18 +119,53 @@ fi
 say "4. permanent boot behavior"
 cat > /usr/local/sbin/valiant-timecheck <<'EOF'
 #!/bin/sh
-# Wait (bounded) for NTP; if it never syncs, set the clock from HTTPS time.
-# Always exits 0 so it can never block cloudflared (remote access) forever.
-for i in $(seq 1 60); do
-  [ "$(timedatectl show -p NTPSynchronized --value)" = yes ] && { echo "valiant-timecheck: NTP synchronized"; exit 0; }
-  sleep 2
+# valiant-timecheck — runs at boot before cloudflared-valiant, and every 10 min.
+# Order of trust, never loosening TLS:
+#   1. saved clock:  never run behind the last saved time (systemd-timesyncd's
+#      /var/lib/systemd/timesync/clock, updated every 60 s and on each sync) —
+#      this is what lifts a 2001 RTC to "recent" before anything else happens
+#   2. NTP:          wait (bounded) for systemd-timesyncd to synchronize
+#   3. HTTPS time:   only if NTP never syncs; certificate-verified only, which works
+#      because step 1 already put the clock inside certificate validity
+# Always exits 0 within ~2 minutes, so remote access can never be blocked forever.
+# VALIANT_TEST_* variables exist only for offline testing.
+CLOCKFILE=${VALIANT_CLOCKFILE:-/var/lib/systemd/timesync/clock}
+WAIT=${VALIANT_WAIT:-60}; PAUSE=${VALIANT_PAUSE:-2}
+now() { if [ -n "${VALIANT_TEST_NOW:-}" ]; then cat "$VALIANT_TEST_NOW"; else date -u +%s; fi; }
+synced() {
+  if [ -n "${VALIANT_TEST_SYNCED:-}" ]; then [ "$VALIANT_TEST_SYNCED" = yes ]
+  else [ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" = yes ]; fi
+}
+setclock() {
+  if [ -n "${VALIANT_TEST_NOW:-}" ]; then echo "$1" > "$VALIANT_TEST_NOW"; else date -u -s "@$1" >/dev/null; fi
+}
+https_time() { ${VALIANT_TEST_HTTPS:-/usr/local/sbin/valiant-netclock https}; }
+log() { echo "valiant-timecheck: $*"; }
+
+# 1. never behind the saved clock
+if [ -f "$CLOCKFILE" ]; then
+  SAVED=$(stat -c %Y "$CLOCKFILE")
+  if [ "$(now)" -lt "$SAVED" ]; then setclock "$SAVED"; log "clock was behind the saved time; advanced to $(date -u -d "@$SAVED" +%FT%TZ)"; fi
+else
+  log "no saved clock file ($CLOCKFILE)"
+fi
+
+# 2. bounded wait for NTP
+i=0
+while [ "$i" -lt "$WAIT" ]; do
+  synced && { log "NTP synchronized"; exit 0; }
+  sleep "$PAUSE"; i=$((i + 1))
 done
-N=$(/usr/local/sbin/valiant-netclock https) || { echo "valiant-timecheck: WARNING no network time (NTP and HTTPS failed); continuing"; exit 0; }
-DIFF=$(( N - $(date -u +%s) ))
-if [ ${DIFF#-} -le 30 ]; then echo "valiant-timecheck: NTP not synced; clock within 30s of HTTPS time"
-elif date -u -s "@$N" >/dev/null; then echo "valiant-timecheck: NTP not synced; clock stepped ${DIFF}s from HTTPS time"
-else echo "valiant-timecheck: WARNING could not set the clock"; fi
-command -v hwclock >/dev/null && hwclock --systohc 2>/dev/null
+
+# 3. certificate-verified HTTPS time (never insecure)
+if N=$(https_time); then
+  D=$(( N - $(now) ))
+  if [ "${D#-}" -gt 30 ]; then setclock "$N"; log "NTP not synced; clock stepped ${D}s from verified HTTPS time"
+  else log "NTP not synced; clock within 30s of verified HTTPS time"; fi
+  [ -z "${VALIANT_TEST_NOW:-}" ] && [ -f "$CLOCKFILE" ] && touch -d "@$N" "$CLOCKFILE"   # save it for the next boot
+else
+  log "WARNING: NTP not synced and verified HTTPS time unavailable (offline, or clock outside certificate validity); continuing without blocking"
+fi
 exit 0
 EOF
 chmod 755 /usr/local/sbin/valiant-timecheck
@@ -172,6 +214,8 @@ timedatectl | tee -a "$LOG"
 N=$(/usr/local/sbin/valiant-netclock https 2>/dev/null) && D=$(( N - $(date -u +%s) )) && { [ ${D#-} -le 5 ] && ok "UTC matches HTTPS time (difference ${D}s)" || warn "UTC differs from HTTPS time by ${D}s"; }
 [ "$(timedatectl show -p NTPSynchronized --value)" = yes ] && ok "System clock synchronized: yes" || warn "System clock synchronized: no (cause: $CAUSE; the HTTPS fallback keeps the clock right every 10 min)"
 [ "$(systemctl is-active systemd-timesyncd)" = active ] && ok "NTP service active"
+CF=/var/lib/systemd/timesync/clock
+[ -f "$CF" ] && ok "saved clock present: $(date -u -r "$CF" +%FT%TZ) (restored at boot, refreshed every 60 s)" || warn "no saved clock file yet (appears after the first sync)"
 
 say "6. val-admin self-test (sign in on your phone if a link appears)"
 OUT=$(runuser -u jim -- ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 \
