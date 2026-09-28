@@ -15,3 +15,8 @@ It:
 5. self-tests the public path.
 
 What it contains: commands, hostnames, the "VAL admin" Access AUD tag and an SSH public-key *fingerprint*. None of these are secret. It contains no credentials, keys, tokens or passwords.
+
+## t.sh (second visit step)
+
+Permanent clock fix: explicit NTP servers, bounded HTTPS-time fallback, and
+`cloudflared-valiant` ordered after a bounded time check. Run once: `sudo sh t.sh`.
